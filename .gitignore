@@ -1,0 +1,8 @@
+﻿node_modules/
+__pycache__/
+*.pyc
+*.log
+.samples-work/
+frames/
+audio.wav
+*.m4s
