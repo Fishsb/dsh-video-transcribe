@@ -45,6 +45,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
 FRAME_RE = re.compile(r"^###\s*\[(\d{1,2}):(\d{2})\]")
+# 补正册常用表格形态：| [mm:ss] | 内容 |  —— 只认「首列是时间点」的行，避免误吞普通表格
+TABLE_FRAME_RE = re.compile(r"^\|\s*\[(\d{1,2}):(\d{2})\]\s*\|(.*)$")
 # 时间点单元格：[00:00] 或 [02:20]–[03:00]（en-dash 与连字符都收）
 RANGE_RE = re.compile(r"\[(\d{1,2}):(\d{2})\](?:\s*[–\-—~]\s*\[(\d{1,2}):(\d{2})\])?")
 TICK_RE = re.compile(r"\x60([^\x60]+)\x60")
@@ -71,6 +73,17 @@ def parse_frames(ocr_path: Path) -> dict[int, str]:
             buf.append(line.strip())
     if cur is not None:
         frames[cur] = " ".join(buf).strip()
+
+    # 表格形态：| [mm:ss] | 原记录 | 复验实有内容 |（补正册用此格式并列多册）
+    # 多列时取**最后一个非空单元格**为内容列 —— 中间的「原记录」列（常为"空"）不是内容。
+    if not frames:
+        for line in ocr_path.read_text(encoding="utf-8").splitlines():
+            m = TABLE_FRAME_RE.match(line.strip())
+            if m:
+                secs = mmss(m.group(1), m.group(2))
+                cells = [c.strip() for c in m.group(3).split("|")]
+                cells = [c.replace("**", "").replace("\x60", "").strip() for c in cells]
+                frames[secs] = next((c for c in reversed(cells) if c), "")
     return frames
 
 
@@ -81,13 +94,17 @@ def merge_supplement(frames: dict[int, str], doc: Path) -> dict[int, str]:
     补正是**只增不改**的独立文件（samples/ 纪律），故这里只对补正中**明确列出**的帧生效，
     未列出的帧仍用原结果 —— 不因补正存在就放宽 C6 空帧率守卫。
     """
-    sup = doc.parent / "帧OCR原始结果_复验补正.md"
-    if not sup.is_file():
-        return frames
     merged = dict(frames)
-    for sec, text in parse_frames(sup).items():
-        if text.strip():
-            merged[sec] = (frames.get(sec, "") + " " + text).strip()
+    # 自动发现所有补正册（帧OCR原始结果_复验补正*.md），按文件名排序保证确定性
+    PLACEHOLDERS = ("空", "无", "（无文字）", "(无文字)", "-", "—", "")
+    for sup in sorted(doc.parent.glob("帧OCR原始结果_复验补正*.md")):
+        for sec, text in parse_frames(sup).items():
+            cleaned = text.strip()
+            # 表格里的「空」只表示"原记录为空"，不是内容本身 —— 不得当作证据并入
+            if cleaned in PLACEHOLDERS or cleaned.startswith("空"):
+                continue
+            if cleaned:
+                merged[sec] = (merged.get(sec, "") + " " + cleaned).strip()
     return merged
 
 
