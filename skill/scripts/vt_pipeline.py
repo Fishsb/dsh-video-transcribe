@@ -30,7 +30,7 @@
 from __future__ import annotations
 
 import argparse
-import base64
+import base64  # noqa: F401  (vision_ocr 编码图像用)
 import gzip
 import http.client
 import json
@@ -648,6 +648,189 @@ def cmd_transcribe(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 画面 OCR（第三层信息：画面补充）
+
+DEFAULT_VISION_URL = "http://127.0.0.1:11434/api/chat"
+DEFAULT_VISION_MODEL = "qwen3.5:9b"
+
+
+def vision_url() -> str:
+    return env_path("VT_VISION_URL") or DEFAULT_VISION_URL
+
+
+def vision_model() -> str:
+    return env_path("VT_VISION_MODEL") or DEFAULT_VISION_MODEL
+
+
+def pick_lowest_video(payload: dict) -> dict:
+    """取最低码率视频流（画面 OCR 只需看得清文字，不追清晰度以省流量）。"""
+    d = dash_of(payload)
+    vids = list(d.get("video") or [])
+    if not vids:
+        raise SystemExit(
+            "[错误] playurl 未返回可下载视频流（可能需要登录 cookie）；"
+            f"dash 顶层键={sorted(d.keys())}")
+    return sorted(vids, key=lambda v: v.get("bandwidth", 0))[0]
+
+
+def download_video(dash: dict, dest: Path) -> Path:
+    """下载视频流；主地址失败退备地址。"""
+    v = pick_lowest_video(dash)
+    urls = [v.get("baseUrl")] + list(v.get("backupUrl") or [])
+    last = None
+    for u in urls:
+        if not u:
+            continue
+        try:
+            n = download_url_to_file(u, dest)
+            print(f"  视频已下载: {dest} ({n / 1048576:.2f} MB, {v.get('height')}P)")
+            return dest
+        except Exception as exc:  # 换备用地址重试
+            last = exc
+            print(f"  主地址失败，尝试备用: {exc}")
+    raise SystemExit(f"[错误] 视频流全部地址下载失败: {last}")
+
+
+def extract_frames(video: Path, frame_dir: Path, interval: int, at: str = "") -> list:
+    """抽帧。默认按固定间隔；--at mm:ss,mm:ss 时按显式时间点抽（更省且可控）。
+
+    返回 [(秒, 帧文件 Path), ...]，按时间升序。
+    """
+    ff = ffmpeg_path()
+    if not ff:
+        raise SystemExit("[错误] 找不到 ffmpeg（用 VT_FFMPEG 指定）")
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    for old in frame_dir.glob("f_*.jpg"):
+        old.unlink()
+
+    picks: list = []
+    if at:
+        for i, ts in enumerate([s.strip() for s in at.split(",") if s.strip()], 1):
+            secs = parse_mmss(ts)
+            dest = frame_dir / f"f_{i:03d}.jpg"
+            run_cmd([ff, "-y", "-loglevel", "error", "-ss", str(secs), "-i", str(video),
+                     "-frames:v", "1", "-vf", "scale=1280:-1", "-q:v", "3", str(dest)])
+            picks.append((secs, dest))
+    else:
+        run_cmd([ff, "-y", "-loglevel", "error", "-i", str(video),
+                 "-vf", f"fps=1/{interval},scale=1280:-1", "-q:v", "3",
+                 str(frame_dir / "f_%03d.jpg")])
+        for i, p in enumerate(sorted(frame_dir.glob("f_*.jpg"))):
+            picks.append((i * interval, p))
+    print(f"  抽帧 {len(picks)} 张（{'显式时间点' if at else f'间隔 {interval}s'}）")
+    return picks
+
+
+def parse_mmss(s: str) -> float:
+    parts = [x for x in str(s).strip().split(":") if x != ""]
+    try:
+        nums = [float(x) for x in parts]
+    except ValueError:
+        raise SystemExit(f"[错误] 无法解析时间点: {s}")
+    secs = 0.0
+    for n in nums:
+        secs = secs * 60 + n
+    return secs
+
+
+def vision_ocr(img: Path, prompt: str) -> str:
+    """调本地视觉模型做 OCR。失败抛错（不静默返回空）。"""
+    body = json.dumps({
+        "model": vision_model(),
+        "messages": [{"role": "user", "content": prompt,
+                      "images": [base64.b64encode(img.read_bytes()).decode()]}],
+        "stream": False,
+        "options": {"temperature": 0},
+    }).encode("utf-8")
+    u = urllib.parse.urlsplit(vision_url())
+    conn_cls = http.client.HTTPSConnection if (u.scheme or "http") == "https" else http.client.HTTPConnection
+    host = u.netloc or "127.0.0.1:11434"
+    path = u.path or "/api/chat"
+    conn = conn_cls(host, timeout=timeout_asr())
+    try:
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        if resp.status != 200:
+            raise RuntimeError(f"视觉模型 HTTP {resp.status}: {raw[:200]!r}")
+        j = json.loads(raw.decode("utf-8"))
+        return ((j.get("message") or {}).get("content") or "").strip()
+    finally:
+        conn.close()
+
+
+OCR_PROMPT = ("只输出这张画面中可见的文字，逐行列出，不要描述、不要解释、不要补充。"
+              "没有文字就只回复：无")
+NO_TEXT_HINTS = ("无", "none", "None", "")
+
+
+def frames_markdown(picks: list, ocr_results: list, interval: int, model: str) -> str:
+    lines = ["# 画面 OCR 原始结果", "",
+             f"> 抽帧{'间隔 ' + str(interval) + 's' if interval else '（显式时间点）'}，共 {len(picks)} 帧；"
+             f"识别模型 {model}（本地 Ollama）。",
+             "> 空白帧表示该时刻画面无可读文字。", ""]
+    for (secs, _), text in zip(picks, ocr_results):
+        lines.append(f"### [{seg_ts(secs)}]")
+        lines.append(text.strip() or "（无文字）")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def check_empty_ratio(picks: list, ocr_results: list) -> str:
+    """空帧率守卫：空帧 ≠ 画面无文字。
+
+    实测教训（2026-09-25）：旧流程把有内容的帧记成空（视觉模型静默失败），
+    导致成品里的画面断言在归档证据中"查无实据"，险些被误判为编造。
+    故空帧率 > 1/3 时必须显式告警，提示先排查 OCR 是否失败。
+    """
+    empty = sum(1 for t in ocr_results if t.strip() in NO_TEXT_HINTS)
+    ratio = empty / len(picks) if picks else 0.0
+    if ratio > 1 / 3:
+        return (f"⚠ 空帧 {empty}/{len(picks)}（{ratio:.0%}）超过 1/3 —— 空帧不等于画面无文字。"
+                f"请先确认是画面真无字，还是视觉模型静默失败（对比帧图体积：空屏通常 <30KB；"
+                f"必要时提高分辨率/换模型重跑）。")
+    return f"空帧 {empty}/{len(picks)}（{ratio:.0%}），在正常范围。"
+
+
+def cmd_frames(args) -> int:
+    bvid = parse_bvid(args.target)
+    info = build_info(bvid) if not args.offline else {}
+    cid = info.get("cid") or args.cid
+    if not cid:
+        raise SystemExit("[错误] 需要 cid（联网时自动取；离线用 --cid 指定）")
+    outdir = out_root() / bvid
+    outdir.mkdir(parents=True, exist_ok=True)
+    ff = ffmpeg_path()
+    if not ff:
+        raise SystemExit("[错误] 找不到 ffmpeg（用 VT_FFMPEG 指定）")
+
+    dash = fetch_playurl(bvid, cid)
+    vfile = outdir / "video.m4s"
+    if not (vfile.is_file() and vfile.stat().st_size > 0):
+        download_video(dash, vfile)
+    else:
+        print(f"  复用已下载视频: {vfile}")
+
+    picks = extract_frames(vfile, outdir / "frames", args.interval, args.at)
+    print(f"  逐帧 OCR（模型 {vision_model()}，共 {len(picks)} 帧，可能较慢）…")
+    results = []
+    for i, (secs, img) in enumerate(picks, 1):
+        try:
+            text = vision_ocr(img, OCR_PROMPT)
+        except Exception as exc:  # 单帧失败不应吞掉：记录为显式失败
+            text = f"<<OCR 失败: {type(exc).__name__}: {exc}>>"
+        results.append(text)
+        preview = text.replace("\n", " / ")[:60]
+        print(f"    [{seg_ts(secs)}] {preview}")
+
+    md = frames_markdown(picks, results, 0 if args.at else args.interval, vision_model())
+    write_utf8(outdir / "帧OCR原始结果.md", md)
+    guard = check_empty_ratio(picks, results)
+    print(f"\n{guard}")
+    print(f"完成: {outdir / '帧OCR原始结果.md'}")
+    return 0
+
+
 def cmd_bili(args) -> int:
     bvid = parse_bvid(args.target)
     info = build_info(bvid)
@@ -689,6 +872,14 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--segment", type=int, default=30, help="超过该秒数则切片转写，默认 30")
     t.add_argument("--outdir", default="", help="本地文件时的产物目录")
     t.set_defaults(func=cmd_transcribe)
+
+    f = sub.add_parser("frames", help="抽帧 + 视觉模型 OCR → 帧OCR原始结果.md（画面补充层）")
+    f.add_argument("target", help="B站 URL 或 BV 号")
+    f.add_argument("--interval", type=int, default=20, help="抽帧间隔秒数，默认 20")
+    f.add_argument("--at", default="", help="显式时间点，如 00:30,02:20,03:00（优先于 --interval）")
+    f.add_argument("--cid", type=int, default=0, help="离线时显式指定 cid")
+    f.add_argument("--offline", action="store_true", help="不抓元数据（需同时给 --cid）")
+    f.set_defaults(func=cmd_frames)
 
     b = sub.add_parser("bili", help="一条龙：元数据 → 音频 → 转写")
     b.add_argument("target", help="B站 URL 或 BV 号")
