@@ -74,6 +74,23 @@ def parse_frames(ocr_path: Path) -> dict[int, str]:
     return frames
 
 
+def merge_supplement(frames: dict[int, str], doc: Path) -> dict[int, str]:
+    """合并同目录的『帧OCR原始结果_复验补正.md』。
+
+    背景：原 OCR 存在**静默失败**（把有内容的帧记成空），会让成品断言被误判为不可核。
+    补正是**只增不改**的独立文件（samples/ 纪律），故这里只对补正中**明确列出**的帧生效，
+    未列出的帧仍用原结果 —— 不因补正存在就放宽 C6 空帧率守卫。
+    """
+    sup = doc.parent / "帧OCR原始结果_复验补正.md"
+    if not sup.is_file():
+        return frames
+    merged = dict(frames)
+    for sec, text in parse_frames(sup).items():
+        if text.strip():
+            merged[sec] = (frames.get(sec, "") + " " + text).strip()
+    return merged
+
+
 def table_rows(text: str, header_keyword: str) -> list[list[str]]:
     """抓取以 header_keyword 所在行为表头的 markdown 表格数据行。"""
     lines = text.splitlines()
@@ -129,7 +146,7 @@ def check_doc(doc: Path, ocr: Path) -> list[tuple[str, str, str]]:
     elif not ocr.is_file():
         rec("C3", SKIP, f"帧 OCR 原始结果不存在（{ocr.name}），无法核对画面断言")
     else:
-        frames = parse_frames(ocr)
+        frames = merge_supplement(parse_frames(ocr), doc)
         if not frames:
             rec("C3", SKIP, "帧 OCR 文件解析不出任何帧")
         else:

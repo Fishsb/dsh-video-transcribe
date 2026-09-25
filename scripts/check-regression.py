@@ -10,6 +10,8 @@
   R2 上游副本纯净     —— upstream/ 与原件逐件一致（未指定原件目录则显式 SKIP，不计通过）
   R3 自有实现层零硬编码 —— 调用 scripts/check-hardcode.py，透传其结论
   R4 端到端实跑（--e2e）—— 跑一次主路线，断言产物语义与样例一致
+  R5 内容准入        —— 调 scripts/check-content.py，判成品文案的断言是否都有真证据
+                        （总验收 #3 每个修正都有依据 / #4 无证据不编造）
 
 三态纪律：PASS / FAIL / SKIP。SKIP **不计通过**（未验证 ≠ 通过），会以退出码 2 传出来。
 
@@ -39,6 +41,7 @@ UPSTREAM = ROOT / "upstream" / "Video-Transcribe"
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "samples-manifest.json"
 CHECK_HARDCODE = HERE / "check-hardcode.py"
+CHECK_CONTENT = HERE / "check-content.py"
 
 # 端到端断言参数（阈值先有实测值再定：本项目实测归一化 ratio=1.0，取 0.95 留出切片边界余量）
 E2E_SAMPLE = "BV1JMbp6MEo5"
@@ -184,6 +187,23 @@ def r3_hardcode() -> None:
         record("R3", FAIL, f"该工具 exit={proc.returncode}：{' / '.join(tail)}")
 
 
+# ---------------------------------------------------------------- R5
+def r5_content() -> None:
+    print("\n【R5】内容准入（总验收 #3 依据 / #4 无证据不编造）")
+    if not CHECK_CONTENT.is_file():
+        record("R5", SKIP, "scripts/check-content.py 不存在，未验证")
+        return
+    proc = subprocess.run([sys.executable, str(CHECK_CONTENT), "--all"], capture_output=True, text=True,
+                          encoding="utf-8", env=child_env())
+    tail = [ln.strip() for ln in (proc.stdout or "").strip().splitlines() if ln.strip()][-1:]
+    if proc.returncode == 0:
+        record("R5", PASS, f"成品断言均有归档证据可核（{tail[0] if tail else ''}）")
+    elif proc.returncode == 2:
+        record("R5", SKIP, f"有未覆盖项（{' '.join(tail)}）")
+    else:
+        record("R5", FAIL, f"内容准入未过：{' '.join(tail)}")
+
+
 # ---------------------------------------------------------------- R4
 def normalize(text: str) -> str:
     t = re.sub(r"\s+", "", text)
@@ -264,6 +284,7 @@ def main() -> int:
     if not args.freeze:
         r2_upstream(origin)
         r3_hardcode()
+        r5_content()
         if args.e2e:
             r4_e2e()
 
