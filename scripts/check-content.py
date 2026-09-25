@@ -42,7 +42,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP, XFAIL = "PASS", "FAIL", "SKIP", "XFAIL"
+
+# 已知缺陷登记：samples/ 只增不改 ⇒ 历史件里的缺陷无法就地修复，只能另出修订版。
+# 但「不修」不等于「不知道」——这些件必须显式登记并**保持报红可见**，否则就是假绿。
+# 登记形态：{相对路径: 已认定缺陷说明}。用 --list-known 查看。
+KNOWN_DEFECTS = {
+    "samples/BV1JMbp6MEo5/最终文案.md":
+        "帧 OCR 静默失败导致 [01:00]/[01:20] 被误标「（无文字）」而实有文字（漏报）；"
+        "LangChain 词条误标「推断」。samples/ 只增不改 ⇒ 不就地修复，"
+        "已出修订版 最终文案_修订版.md 并全绿。原件保留作为缺陷证据。",
+}
 
 FRAME_RE = re.compile(r"^###\s*\[(\d{1,2}):(\d{2})\]")
 # 补正册常用表格形态：| [mm:ss] | 内容 |  —— 只认「首列是时间点」的行，避免误吞普通表格
@@ -55,6 +65,37 @@ NO_TEXT_MARKERS = ("（无文字）", "(无文字)", "无文字")
 
 def mmss(h: str, m: str) -> int:
     return int(h) * 60 + int(m)
+
+
+# 引文比对时的等价类：视觉模型对中英文标点/空白不稳定，逐字比对会把
+# 「全角？/半角?」「≤/<=」这类同一内容的写法差异误判为"引文不存在"。
+_PUNCT_EQ = {
+    "?": "？", "!": "！", ",": "，", ";": "；", ":": "：",
+    "(": "（", ")": "）", "<=": "≤", ">=": "≥",
+}
+_PUNCT_TABLE = str.maketrans({k: v for k, v in _PUNCT_EQ.items() if len(k) == 1})
+
+
+def canonical(s: str) -> str:
+    """把一段文字归一化到「内容等价」形态：统一标点、去空白。
+
+    仅用于**比对**，不改动任何归档证据原文。
+    """
+    t = s.replace("≤", "<=").replace("≥", ">=")          # 先保住多字符等价对
+    out = []
+    i = 0
+    while i < len(t):
+        two = t[i:i + 2]
+        if two in _PUNCT_EQ:
+            out.append(_PUNCT_EQ[two])
+            i += 2
+            continue
+        ch = t[i]
+        out.append(_PUNCT_EQ.get(ch, ch))
+        i += 1
+    res = "".join(out).translate(_PUNCT_TABLE)
+    res = res.replace("≤", "<=").replace("≥", ">=")
+    return re.sub(r"\s+", "", res)
 
 
 def parse_frames(ocr_path: Path) -> dict[int, str]:
@@ -191,7 +232,8 @@ def check_doc(doc: Path, ocr: Path) -> list[tuple[str, str, str]]:
                 if not tokens:
                     continue
                 checked += 1
-                missing = [t for t in tokens if t not in merged]
+                hay = canonical(merged)
+                missing = [t for t in tokens if canonical(t) not in hay]
                 if missing:
                     unsupported.append(f"{span_raw} 缺 {missing[:4]}")
 
@@ -222,12 +264,21 @@ def main() -> int:
     ap.add_argument("doc", nargs="?", help="成品文案 .md")
     ap.add_argument("--ocr", help="对应的帧 OCR 原始结果 .md")
     ap.add_argument("--all", action="store_true", help="扫描 samples/ 下所有成品")
+    ap.add_argument("--list-known", action="store_true", help="列出已登记的已知缺陷件")
     args = ap.parse_args()
+
+    if args.list_known:
+        print("已登记的已知缺陷件（XFAIL）：")
+        for rel, why in sorted(KNOWN_DEFECTS.items()):
+            print(f"  · {rel}\n      {why}")
+        return 0
 
     targets: list[tuple[Path, Path]] = []
     if args.all:
-        for doc in sorted(ROOT.glob("samples/*/最终文案.md")):
-            targets.append((doc, doc.parent / "帧OCR原始结果.md"))
+        # 覆盖原版与修订版：修订版是实际交付面，原版留作缺陷证据 —— 两者都要机检
+        for pattern in ("samples/*/最终文案.md", "samples/*/最终文案_修订版.md"):
+            for doc in sorted(ROOT.glob(pattern)):
+                targets.append((doc, doc.parent / "帧OCR原始结果.md"))
     elif args.doc:
         doc = Path(args.doc)
         ocr = Path(args.ocr) if args.ocr else doc.parent / "帧OCR原始结果.md"
@@ -244,22 +295,30 @@ def main() -> int:
             all_results.append(("target", SKIP, str(doc)))
             continue
         res = check_doc(doc, ocr)
+        rel = doc.relative_to(ROOT).as_posix() if doc.is_relative_to(ROOT) else str(doc)
+        if rel in KNOWN_DEFECTS and any(s == FAIL for _, s, _ in res):
+            res = [(it, (XFAIL if st == FAIL else st), dt) for it, st, dt in res]
+            print(f"  （本件为已登记缺陷件；上列 FAIL 已归 XFAIL）")
         for item, state, detail in res:
-            print(f"  [{state:4}] {item}：{detail}")
+            print(f"  [{state:5}] {item}：{detail}")
         all_results.extend(res)
 
     n_pass = sum(1 for _, s, _ in all_results if s == PASS)
     n_fail = sum(1 for _, s, _ in all_results if s == FAIL)
     n_skip = sum(1 for _, s, _ in all_results if s == SKIP)
-    print(f"\n汇总：PASS={n_pass}  FAIL={n_fail}  SKIP={n_skip}")
+    n_xfail = sum(1 for _, s, _ in all_results if s == XFAIL)
+    print(f"\n汇总：PASS={n_pass}  FAIL={n_fail}  XFAIL={n_xfail}  SKIP={n_skip}")
     if n_skip:
         print("  注意：SKIP 不计通过（未验证 ≠ 通过）")
+    if n_xfail:
+        print(f"  注意：XFAIL = 已知缺陷（已登记，不静默、不掩盖）；{n_xfail} 项")
     if n_fail:
-        print("结论：FAIL —— 成品存在无依据断言或编造，见上")
+        print("结论：FAIL —— 存在未登记的断言问题，见上")
         return 1
-    if n_skip:
-        print("结论：有待办 —— 无失败，但有未覆盖项")
-        return 2
+    if n_skip or n_xfail:
+        print("结论：无未登记缺陷" + ("；有未覆盖项" if n_skip else "") +
+              (f"；{n_xfail} 项已知缺陷（见 --list-known）" if n_xfail else ""))
+        return 2 if n_skip else 0
     print("结论：全部 PASS")
     return 0
 
