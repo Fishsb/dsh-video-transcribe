@@ -6,3 +6,5 @@ __pycache__/
 frames/
 audio.wav
 *.m4s
+output/
+.roundtable/

@@ -22,14 +22,13 @@
 用法（Git Bash / 任意终端）：
   python video_text_extract.py <命令> <视频路径或链接> [选项]
 
-重要环境事实（本机 2026-08-07 验证）：
-  - 必须用装有 faster-whisper 的 Python 运行（本机: hermes venv）：
-      C:\\Users\\lk\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe
-  - 本地模型缓存于 D:\\lk\\.cache\\faster-whisper\\（base + small 已下载），
-    脚本自动优先使用本地模型，不重复下载。
-  - yt-dlp / ffmpeg 可用；本机未装 ffprobe（转写前无需探测，不影响流程）。
-  - B站下载依赖开源工具 BBDown（已装于 C:\\Users\\lk\\bin\\BBDown\\），自带多线程与 WBI 签名，
-    无需自备依赖；hermes venv 的 PATH 不含 bin 目录，脚本用绝对路径常量定位它。
+主路线（2026-09-25 实测）：
+  - 转写主路线是**宿主 ASR 服务**（默认 http://127.0.0.1:3082/rpc，SenseVoice）：
+    同目录 vt_pipeline.py 的 probe / transcribe / bili 子命令直接可用，纯标准库、无需第三方包。
+  - 本脚本的 transcribe / bili / frames 属**可选适配器**：依赖 faster-whisper、BBDown、yt-dlp，
+    本机 2026-09-25 实测三者均未安装（不影响主路线）。
+  - ffmpeg / ffprobe 由 PATH 运行时探测；可用 VT_FFMPEG / VT_FFPROBE / VT_TOOL_DIR 覆盖。
+  - 全部外部路径一律运行时探测 + 环境变量覆盖，代码中不写死任何本机绝对路径。
 
 输出规范：
   本地视频 → outputs/srt、outputs/txt、outputs/json（{视频名}_{方法}_{语言}.*）
@@ -50,22 +49,46 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- 基础工具
 
-FFMPEG_FALLBACK_DIR = Path(r"C:\Users\lk\Documents\视频")
-BBDown_PATH = Path(r"C:\Users\lk\bin\BBDown\BBDown.exe")  # 开源 B站下载器（自包含版，已安装）
-LOCAL_MODEL_CACHE = Path(r"D:\lk\.cache\faster-whisper")  # 本机已下载模型的缓存根
+# 路径一律运行时探测 + 环境变量覆盖，禁止写死本机绝对路径。可用环境变量：
+#   VT_TOOL_DIR   额外候选工具目录（多个用 os.pathsep 分隔）
+#   VT_FFMPEG / VT_FFPROBE / VT_BBDOWN  直接指定可执行文件全路径
+#   VT_VISION_PY  视觉辅助脚本（vision_ask.py）全路径；VT_PYTHON 跑它用的解释器
+#   VT_BBDOWN_DIR / VT_MODEL_CACHE  旧调用方兼容用的目录提示（可选）
+BBDOWN_DIR = Path(os.environ.get("VT_BBDOWN_DIR", "")) if os.environ.get("VT_BBDOWN_DIR") else None
+LOCAL_MODEL_CACHE = (Path(os.environ["VT_MODEL_CACHE"])
+                     if os.environ.get("VT_MODEL_CACHE") else Path.home() / ".cache" / "faster-whisper")
+
+
+def _env(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
+def tool_dirs() -> list:
+    """候选工具目录：VT_TOOL_DIR + 各 VT_*_PATH 的父目录。"""
+    dirs = [Path(d) for d in _env("VT_TOOL_DIR").split(os.pathsep) if d]
+    for key in ("VT_FFMPEG", "VT_FFPROBE", "VT_BBDOWN"):
+        p = _env(key)
+        if p:
+            dirs.append(Path(p).parent)
+    return dirs
 KNOWN_MODELS = ("tiny", "base", "small", "medium", "large-v3")
 
 
 def find_tool(name: str) -> str:
-    """在 PATH 中查找工具，找不到则尝试本机已知的 ffmpeg 目录。"""
+    """在 PATH 中查找工具；找不到则试 VT_TOOL_DIR / VT_FFMPEG 等候选目录（运行时探测）。"""
     p = shutil.which(name)
     if p:
         return p
-    cand = FFMPEG_FALLBACK_DIR / (name + ".exe")
-    if cand.exists():
-        return str(cand)
+    exe = name if (name.lower().endswith(".exe") or os.name != "nt") else name + ".exe"
+    for d in tool_dirs():
+        cand = d / exe
+        try:
+            if cand.exists():
+                return str(cand)
+        except OSError:
+            continue
     raise FileNotFoundError(
-        f"找不到 {name}，请确认已安装并加入 PATH，或放置于 {FFMPEG_FALLBACK_DIR}"
+        f"找不到 {name}，请确认已安装并加入 PATH，或用 VT_TOOL_DIR / 对应 VT_* 环境变量指定位置"
     )
 
 
@@ -210,8 +233,9 @@ def transcribe_audio(media: Path, model_name: str, language: str, outdir: Path,
         from faster_whisper import WhisperModel
     except ImportError:
         print("[错误] 当前 Python 未安装 faster-whisper。")
-        print("       必须用装有它的 Python 运行本脚本，例如：")
-        print('       "C:\\Users\\lk\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe" video_text_extract.py transcribe ...')
+        print("       faster-whisper 属可选适配器（本机 2026-09-25 实测未安装）。")
+        print("       转写主路线请用同目录 vt_pipeline.py（宿主 ASR，无需第三方包）：")
+        print(f'       "{sys.executable}" vt_pipeline.py transcribe <音频文件或 BV 号>')
         sys.exit(1)
 
     model_path = resolve_model(model_name)
@@ -356,17 +380,20 @@ def link_pipeline(url: str, model_name: str, language: str, outdir: Path) -> Non
 
 # ---------------------------------------------------------------- B站下载（BBDown 开源下载器）
 def find_bbdown() -> str:
-    """定位 BBDown（开源 B站下载器，v1.6.3+，自带多线程 + WBI 签名，规避 yt-dlp 的 412 反爬）。
-    hermes venv 的 PATH 不含 C:\\Users\\lk\\bin，故优先用绝对路径常量，其次回退 shutil.which。"""
-    p = shutil.which("BBDown")
-    if p:
-        return p
-    if BBDown_PATH.exists():
-        return str(BBDown_PATH)
-    raise FileNotFoundError(
-        f"找不到 BBDown。请下载自包含版放到 {BBDown_PATH}，或加入 PATH。\n"
-        f"下载: https://github.com/nilaoda/BBDown/releases"
-    )
+    """定位 BBDown（可选适配器：开源 B站下载器，自带多线程 + WBI 签名）。
+    探测顺序：VT_BBDOWN 环境变量 → PATH(shutil.which) → VT_TOOL_DIR 候选目录。
+    主路线（vt_pipeline.py）不需要它：B站 API 直连 + ffmpeg 已覆盖取音轨与弹幕。"""
+    override = _env("VT_BBDOWN")
+    if override and Path(override).exists():
+        return override
+    try:
+        return find_tool("BBDown")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{exc}\nBBDown 属可选适配器（本机 2026-09-25 实测未安装）："
+            f"下载自包含版后加入 PATH，或用 VT_BBDOWN 指定其全路径。\n"
+            f"下载: https://github.com/nilaoda/BBDown/releases"
+        ) from None
 
 
 def bili_download_audio(bvid: str, out_dir: Path, ffmpeg: str) -> Path:
@@ -464,13 +491,15 @@ def danmaku_download(url: str, outdir: Path) -> Path:
 
     产物：<标题>.xml（B站标准弹幕 XML）+ <标题>.ass + 弹幕时间线.txt
     用途：供 WorkBuddy 做「弹幕评论拆解点评」——把弹幕按时间点对齐文案段落。
-    依赖 BBDown（自带 WBI 签名，老 API x/v1/dm/list.so 已失效）。
+    可选适配器：依赖 BBDown。
+    主路线（vt_pipeline.py danmaku）走 API 直连 x/v1/dm/list.so（2026-09-25 实测可用）+ 标准库
+    XML 解析，无需 BBDown。
     """
     import re as _re
     bbdown = find_bbdown()
     if not bbdown:
         raise FileNotFoundError(
-            f"找不到 BBDown。请下载自包含版放到 {BBDOWN_PATH}，或加入 PATH。\n"
+            f"找不到 BBDown。请下载自包含版加入 PATH，或用 VT_BBDOWN 指定全路径。\n"
             f"下载: https://github.com/nilaoda/BBDown/releases"
         )
     m = _re.search(r"(BV[0-9A-Za-z]{10})", url)
@@ -792,7 +821,7 @@ def frames_extract(url: str, outdir: Path, frames: int = 8, model: str = "minima
     import glob as _glob
     bbdown = find_bbdown()
     if not bbdown:
-        raise FileNotFoundError(f"找不到 BBDown（用于下载视频画面），请安装到 {BBDOWN_PATH}")
+        raise FileNotFoundError("找不到 BBDown（用于下载视频画面），请加入 PATH 或用 VT_BBDOWN 指定全路径")
     m = _re.search(r"(BV[0-9A-Za-z]{10})", url)
     bvid = m.group(1) if m else url
 
@@ -829,16 +858,18 @@ def frames_extract(url: str, outdir: Path, frames: int = 8, model: str = "minima
         raise FileNotFoundError("所有时间点抽帧均失败，请检查 --at 时间点是否在视频时长内")
 
     # 4. 视觉模型 OCR（vision-analyze 技能）
-    vision_py = r"C:\Users\lk\.workbuddy\skills\vision-analyze\scripts\vision_ask.py"
+    vision_py = _env("VT_VISION_PY") or str(Path(__file__).resolve().parent / "vision_ask.py")
     if not os.path.isfile(vision_py):
-        raise FileNotFoundError(f"找不到视觉辅助脚本: {vision_py}")
+        raise FileNotFoundError(
+            f"找不到视觉辅助脚本: {vision_py}\n"
+            f"用 VT_VISION_PY 指定 vision_ask.py 全路径（可选适配器，主路线不需要）。")
     md_lines = ["# 画面信息（AI 识图，语义导向抽帧）", "",
                 f"> 视频: {url} | 模型: {model} | 抽帧 {len(frame_paths)} 张 | 选帧: {src_desc}",
                 "> 每帧对应一段文案（信号词/补充说明见帧标题），音频未覆盖的信息在纠错成稿时可作补充引用。", ""]
     for i, f in enumerate(frame_paths, 1):
         print(f"  [识图] 分析第 {i}/{len(frame_paths)} 帧（{f.name}）…")
         r = run_cmd([
-            "C:/Users/lk/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe", vision_py,
+            _env("VT_PYTHON") or sys.executable, vision_py,
             "--image", str(f), "--model", model,
             "--prompt", "这是教学视频的截帧。请完整提取画面中所有可见的文字信息：PPT标题、要点列表、图表、书籍封面文字、字幕等。如果画面主要是人像没有文字，请说明画面内容和是否有文字。用中文回答。",
         ], quiet=False)
