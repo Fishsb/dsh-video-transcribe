@@ -1,0 +1,8 @@
+{
+  "language": "zh",
+  "mode": "segmented",
+  "duration_sec": 313.6,
+  "chars": 1841,
+  "asr_url": "http://127.0.0.1:3082/rpc",
+  "segments": 11
+}
