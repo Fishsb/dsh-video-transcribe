@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -216,7 +217,10 @@ def r4_e2e() -> None:
     if not pipeline.is_file():
         record("R4", SKIP, "skill/scripts/vt_pipeline.py 不存在，未实跑")
         return
-    outdir = Path(os.environ.get("TEMP", ".")) / "vt-regression-out"
+    # 用 tempfile.gettempdir() 而非 os.environ["TEMP"]：后者是 Windows 约定，
+    # WSL/Linux 无该变量 ⇒ 取默认值 "." ⇒ 回归产物落进仓库根目录（实测踩坑）。
+    # gettempdir() 按 TMPDIR/TEMP/TMP 顺序解析，全缺省时退 /tmp，跨平台安全。
+    outdir = Path(tempfile.gettempdir()) / "vt-regression-out"
     env = child_env()
     env["VT_OUTDIR"] = str(outdir)
     proc = subprocess.run([sys.executable, str(pipeline), "bili", E2E_SAMPLE],
