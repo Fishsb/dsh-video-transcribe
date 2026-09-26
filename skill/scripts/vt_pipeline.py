@@ -1204,7 +1204,7 @@ def eta_frames(n: int) -> float:
 
 def frames_stage(outdir: Path, picks: list, model: str, resume: bool, progress: Progress,
                  total_eta: float | None = None, out: Path | None = None,
-                 guard_cb=None, verbose: bool = True) -> tuple[Path, list, str, str]:
+                 guard_cb=None, verbose: bool = True, interval: int = 0) -> tuple[Path, list, str, str]:
     """逐帧 OCR 阶段（含缓存/续跑/进度）。返回 (产物路径, entries, 守卫文本)。
 
     --resume 的判据不是「有没有产物文件」，而是**逐帧的缓存键**：
@@ -1282,7 +1282,7 @@ def frames_stage(outdir: Path, picks: list, model: str, resume: bool, progress: 
     if times:
         note += f"，中位 {sorted(times)[len(times) // 2]:.1f}s"
     out_p = out or (outdir / "帧OCR原始结果.md")
-    md = frames_markdown(picks, entries, 0, model, reused=reused, guard_note=guard)
+    md = frames_markdown(picks, entries, interval, model, reused=reused, guard_note=guard)
     write_utf8(out_p, md)
     return out_p, entries, guard, note
 
@@ -1312,7 +1312,7 @@ def cmd_frames(args) -> int:
         prog = Progress(2)   # 跳过抽帧 + 画面 OCR，两步
         prog.skip("抽帧", f"直接使用本地帧目录 {local_frames}（{len(picks)} 张）")
         out_p, entries, guard, note = frames_stage(outdir, picks, vision_model(), resume, prog,
-                                                  verbose=False)
+                                                  verbose=False, interval=args.interval)
         fails = sum(1 for e in entries if not e["ok"])
         print(f"\n{guard}")
         print(f"完成: {out_p}  （{note}）")
@@ -1363,7 +1363,8 @@ def cmd_frames(args) -> int:
         prog.done("抽帧", t0, f"{len(picks)} 张")
 
     out_p, entries, guard, note = frames_stage(outdir, picks, vision_model(), resume, prog,
-                                              verbose=False)
+                                              verbose=False,
+                                              interval=0 if args.at else args.interval)
     fails = sum(1 for e in entries if not e["ok"])
     print(f"\n{guard}")
     print(f"完成: {out_p}  （{note}）")
@@ -1475,7 +1476,8 @@ def cmd_bili(args) -> int:
             picks = extract_frames(vfile, frame_dir, args.interval, args.at)
             prog.done("抽帧", t0, f"{len(picks)} 张")
         ocr_p, entries, guard, note = frames_stage(outdir, picks, vision_model(), resume, prog,
-                                                  verbose=False)
+                                                  verbose=False,
+                                                  interval=0 if args.at else args.interval)
         frame_fails = sum(1 for e in entries if not e["ok"])
         frame_note = note + f"｜{guard}"
         print(f"  {guard}")
@@ -1490,13 +1492,17 @@ def cmd_bili(args) -> int:
         print(f"  [提示] 有 {len(left)} 项旧中间物未清（不是本次产生的，按纪律不动它们）："
               f"{', '.join(p.name for p in left)}；需要清可自行删除")
 
-    produced = sorted(p.name for p in outdir.iterdir() if p.is_file())
+    INTERMEDIATE_NAMES = {"audio.m4s", "audio.wav", "video.m4s", FRAMES_CACHE_NAME}
+    delivered = sorted(p.name for p in outdir.iterdir()
+                       if p.is_file() and p.name not in INTERMEDIATE_NAMES)
     print(f"\n完成: {outdir}")
     print(f"  info.json 键数={len(info)}  danmaku_count={info.get('danmaku_count', '-')}  "
           f"comments_count={info.get('comments_count', '-')}  转写 {len(tr.get('text', ''))} 字")
     if want_frames:
         print(f"  画面层: {ocr_p}（{frame_note}）")
-    print(f"  本次产物清单({len(produced)} 件): {', '.join(produced)}")
+    print(f"  交付产物({len(delivered)} 件): {', '.join(delivered)}")
+    print(f"  中间物/运行状态（不在交付件内）: audio.m4s / audio.wav / video.m4s / segs/ "
+          f"/ {FRAMES_CACHE_NAME} / frames/_failures.json")
     return 1 if (frame_fails or not tr.get("text")) else 0
 
 
