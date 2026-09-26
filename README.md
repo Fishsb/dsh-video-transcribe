@@ -28,11 +28,14 @@
   ├─ ④ 本地转写      sherpa-onnx + SenseVoice（CPU 可跑，离线，免 Key）
   │                  整段稿 + 30 秒切片稿（带时间轴）
   │
-  ├─ ⑤ 二次纠正      ┌ 元数据标签  ┐
+  ├─ ⑤ 画面层        同一接口取最低码率视频流 → 抽帧 → 本地视觉模型 OCR
+  │                  （`bili --frames` 一条命令带出；视频流已下过不重下）
+  │
+  ├─ ⑥ 二次纠正      ┌ 元数据标签  ┐
   │                  ├ 评论区内容  ├─▶ 三方交叉，逐条给依据
   │                  └ 画面 OCR   ┘
   │
-  └─ ⑥ 出稿          最终文案.md + 原始转写 + 元数据档 + 帧 OCR 原始结果
+  └─ ⑦ 出稿          最终文案.md + 原始转写 + 元数据档 + 帧 OCR 原始结果
 ```
 
 三条优先级原则：
@@ -40,6 +43,21 @@
 1. **字幕 > 转写**——字幕零误差，转写只是拿不到字幕时的兜底。
 2. **元数据在下载前就抓**——标题/标签/评论本身就是整理文案时的参考答案。
 3. **本地转写、证据纠正**——本地模型快且免费，纠正环节由大模型做精修，但**每条修正都要能指出依据**（来自画面文字或元数据），不靠猜。
+
+## 命令速查（主路线，零第三方依赖）
+
+```bash
+python3 skill/scripts/vt_pipeline.py probe                 # 探测 ffmpeg / 宿主 ASR / 视觉模型（不联网不写盘）
+python3 skill/scripts/vt_pipeline.py bili <BV号或URL>                        # 元数据 + 音轨 + 转写
+python3 skill/scripts/vt_pipeline.py bili <BV号或URL> --frames --interval 10 # 一条命令出全套（含画面层）
+python3 skill/scripts/vt_pipeline.py bili <BV号或URL> --frames --resume      # 续跑：已完成的段落跳过
+python3 skill/scripts/vt_pipeline.py frames <BV号或URL> --at 00:30,02:20,03:00  # 指定时间点取样帧
+```
+
+- 需要完整三层产物时**只需一条命令**：`bili <URL> --frames`。
+- 中间物（`audio.m4s` / `audio.wav` / `segs/` / `video.m4s` / `frames/`）**默认本次跑完即清**；
+  `--keep-intermediate` 保留。清理只针对本次新产生的文件，**不动 `output/` 下的历史产物**。
+- 每阶段都有进度：`[3/6] 转写中… 预计 00:58`。
 
 ## 成品长什么样
 
@@ -74,6 +92,7 @@ video-transcribe/
 ├── upstream/         上游项目纯副本（保持可对账，不在此目录内改）
 ├── docs/             方案档 · 资产盘点 · 本机环境事实 · 方案与验收
 ├── samples/          实证产物（每个视频一个目录，含成品与原始稿）
+├── output/           运行产物（默认落此，git 忽略；清理中间物只作用于本次新产生的文件）
 └── scripts/          本项目自有工具脚本
 ```
 

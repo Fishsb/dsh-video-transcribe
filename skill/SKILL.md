@@ -30,6 +30,10 @@ skill/scripts/vt_pipeline.py   # 纯 Python 标准库，零第三方依赖
 | `VT_TOOL_DIR` | 额外候选工具目录（可多个，用 `;` 分隔） | 空 |
 | `VT_PYTHON` | 写进元数据 / 跑辅助脚本的解释器 | `sys.executable` |
 | `VT_BBDOWN` / `VT_VISION_PY` | 可选适配器的可执行文件 / 脚本全路径 | 空 |
+| `VT_VISION_URL` / `VT_VISION_MODEL` | 本地视觉模型端点 / 模型名 | `127.0.0.1:11434/api/chat` / `qwen3.5:9b` |
+| `VT_VISION_THINK` | `think` 开关：`0` 关思考（缺省）/ `1` 开 / `omit` 完全不传该参数 | `0` |
+| `VT_VISION_RETRY` | 单帧调用次数上限 | 2（失败重试一次） |
+| `VT_VISION_MAX_SIDE` | 送模型的帧最长边像素 | 960 |
 | `VT_TIMEOUT_HTTP` / `VT_TIMEOUT_ASR` | 秒 | 60 / 600 |
 
 ## 决策树
@@ -45,11 +49,15 @@ skill/scripts/vt_pipeline.py   # 纯 Python 标准库，零第三方依赖
   ① 元数据：vt_pipeline.py meta <URL>     → info.json + 弹幕时间线.txt
   ② 取音轨：vt_pipeline.py audio <URL>    → audio.m4s + audio.wav（16k 单声道）
   ③ 转写　：vt_pipeline.py transcribe <URL> → 原始转写.txt / 原始转写_分段.md
-  ④ 一条龙：vt_pipeline.py bili <URL>     → ①+②+③ 一次完成
-  ⑤ 纠正成稿：读 info.json + 原始转写 → 最终文案.md（见「最终文案格式规范」）
+  ④ 一条龙：vt_pipeline.py bili <URL>              → ①+②+③ 一次完成
+           vt_pipeline.py bili <URL> --frames     → ①+②+③+画面层（三层产物一次给全）
+  ⑤ 纠正成稿：读 info.json + 原始转写 + 帧OCR原始结果 → 最终文案.md（见「最终文案格式规范」）
 ```
 
 优先级：**软字幕 > 语音转写 > OCR**；在线场景 **字幕 > 取音轨转写**。
+
+> 需要完整三层产物时**一条命令就够**：`bili <URL> --frames`（2026-09-26 起）。
+> 画面层与音轨共用一个 playurl 结果，视频流已下过就不重下。
 
 ## 主路线命令速查
 
@@ -60,18 +68,26 @@ skill/scripts/vt_pipeline.py   # 纯 Python 标准库，零第三方依赖
 PY="<你的 python.exe 全路径>"
 SCRIPT="<本技能目录>/scripts/vt_pipeline.py"
 
-"$PY" "$SCRIPT" probe                          # 探测 ffmpeg / ffprobe / 宿主 ASR（不联网、不写盘）
+"$PY" "$SCRIPT" probe                          # 探测外部程序 / 宿主 ASR / 视觉模型（缺省不联网、不写盘）
+"$PY" "$SCRIPT" probe --vision                 # 追加：视觉模型思考模式探查（联网，发一条极小请求）
 "$PY" "$SCRIPT" meta       <B站URL或BV号>       # 元数据 + 评论 + 弹幕 → info.json
 "$PY" "$SCRIPT" danmaku    <B站URL或BV号>       # 只抓弹幕 → 弹幕时间线.txt
 "$PY" "$SCRIPT" audio      <B站URL或BV号>       # 最低码率音轨 → audio.wav(16k 单声道)
 "$PY" "$SCRIPT" transcribe <B站URL或BV号>       # 同上再调宿主 ASR 转写
 "$PY" "$SCRIPT" transcribe <本地音频/视频> --outdir <目录>
-"$PY" "$SCRIPT" bili       <B站URL或BV号>       # 一条龙
+"$PY" "$SCRIPT" frames     <B站URL或BV号>       # 画面层：抽帧 + 视觉模型 OCR → 帧OCR原始结果.md
+"$PY" "$SCRIPT" frames     <URL> --at 00:30,02:20  # 显式时间点取样（比 --interval 更省更可控）
+"$PY" "$SCRIPT" bili       <B站URL或BV号>       # 一条龙：元数据 → 音轨 → 转写
+"$PY" "$SCRIPT" bili       <URL> --frames --interval 10   # 一条龙含画面层（一次出全三层）
+"$PY" "$SCRIPT" bili       <URL> --resume        # 续跑：已完成的段落跳过，不重下不重跑
+"$PY" "$SCRIPT" bili       <URL> --frames --keep-intermediate   # 保留中间物（排障用）
 ```
 
 产物落在 `$VT_OUTDIR/<bvid>/` 下（默认 `./output/<bvid>/`）：`info.json`、`弹幕时间线.txt`、
-`audio.m4s`、`audio.wav`、`原始转写.txt`、`原始转写_分段.md`、`转写元信息.json`。
-**绝不写 samples/**（那是实证产物，只增不改）。
+`原始转写.txt`、`原始转写_分段.md`、`转写元信息.json`；带 `--frames` 时再加 `帧OCR原始结果.md`。
+中间物（`audio.m4s` / `audio.wav` / `segs/` / `video.m4s` / `frames/` / 帧 OCR 缓存）
+**默认本次跑完即清**，`--keep-intermediate` 保留；清理**只针对本次新产生的文件**，
+不动 `output/` 下的历史产物。**绝不写 samples/**（那是实证产物，只增不改）。
 
 ## 可选适配器（本机 2026-09-25 实测**不存在**，主路线不需要）
 
@@ -139,6 +155,8 @@ SCRIPT="<本技能目录>/scripts/vt_pipeline.py"
 
 - **不依赖 BBDown**：走 `playurl` 接口取最低码率视频流（与取音轨同一套机制），第三方下载器缺失不影响本层。
 - 视觉模型走本地 Ollama（默认 `qwen3.5:9b`），可用 `VT_VISION_URL` / `VT_VISION_MODEL` 覆盖。
+- **一条龙自带画面层（2026-09-26 起）**：`bili <URL> --frames [--interval N]` 一次产出全套；
+  视频流与音轨同源（同一个 `playurl` 结果），已下过就不重下。
 - 抽帧时间点：`--at` 显式指定优先；未指定则按 `--interval`（默认 20s）均匀采样。
 - 视觉模型 OCR 可能误读，重要文字（书名/数字/专名）建议交叉验证；画面信息仅作补充，不替代音轨转写。
 
@@ -146,6 +164,20 @@ SCRIPT="<本技能目录>/scripts/vt_pipeline.py"
 > 记成空（视觉模型静默失败），导致成品里的画面断言在归档证据中"查无实据"，险些被误判为编造。
 > `frames` 跑完会检查空帧占比，**> 1/3 时显式告警**，提示先排查 OCR 是否失败
 > （对比帧图体积：空屏通常 <30KB）。机检见 `scripts/check-content.py` 的 C6 守卫。
+>
+> 🔴 **静默失效已定位并修复（2026-09-26 实测）**：老实现只取 `message.content`，而请求体**不传 `think`**，
+> Ollama 对带思考能力的模型会走思考模式，把文字产在 `message.thinking`，`content` 于是为空**而不报错**。
+> 同一帧实测（`qwen3.5:9b`）：不传 `think` → 91.2s / thinking 1629 字 / content 曾为空；
+> 传 `think:false` → **25.9s（3.5x）** / thinking 0 字 / 识别内容无实质差异（均 11 行）。
+>
+> 现在三态分明，**失败必可见**：
+> - `content` 非空 → 正常；
+> - `content` 空而 `thinking` 非空 → 抛 `VisionThinkingOnly`，帧内记 `<<疑似思考模式吞输出>>`；
+> - 两者都空 → 抛 `VisionEmptyOutput`。
+>
+> 二者都是**调用失败**，不是「此处无文字」：失败帧不进缓存（续跑必重试）、失败台账落在
+> `frames/_failures.json`、守卫把「失败帧」与「空帧」分开报（失败数量任何比例都告警，不再被 1/3 阈值掩盖）。
+> 反证开关：`VT_VISION_THINK=omit` 退回修复前行为，用来验证兜底真的会拦。
 
 > 📌 旧适配器 `video_text_extract.py frames` 仍保留，但它依赖 BBDown（本机不存在）与
 > `VT_VISION_PY` 视觉脚本，**默认不可用**；主路线一律用 `vt_pipeline.py frames`。
