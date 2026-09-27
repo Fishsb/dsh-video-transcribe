@@ -49,6 +49,60 @@ E2E_SAMPLE = "BV1JMbp6MEo5"
 E2E_MIN_SIM = 0.95
 E2E_MIN_KEYS = 17
 
+# 自上游探测的理由：R2 靠命令行参数才跑得起来 ⇒ 实际长期处于 SKIP，
+# 而 SKIP 不计通过，等于「上游纯净性从未被验证」。
+# 探测方式见 find_upstream_origin()：按目录名找候选，再用内容复核，复核不过就丢弃。
+# （此处刻意不写任何本机绝对路径字面量：本仓 R3 门禁连注释一起扫。）
+def find_upstream_origin() -> Path | None:
+    """自动定位上游原件目录；找不到返回 None（调用方据此显式 SKIP）。
+
+    ⚠️ 这里**刻意不写死任何本机绝对路径**——本仓 R3 门禁禁止自有实现层出现
+    「盘符+用户名」这类机器专属字面量（实测：写死候选落点会直接把 R3 打红）。
+    改为「按结构发现」：在 WSL 挂载的盘符根下按目录名找，外加一个可用环境变量兜底。
+    """
+    name = "Video-Transcribe"              # 上游项目名（结构特征，非机器路径）
+
+    def verified(cand: Path) -> bool:
+        """内容复核：候选必须与本仓 upstream/ 的多件文件 sha256 一致才算数。
+
+        ⚠️ 只按目录名匹配是不够的——实测本机存在**同名但完全不同**的目录
+        （另一项目也叫 Video-Transcribe）：单靠名字会选错对象，
+        轻则 R2 假 FAIL，重则拿错误原件比对得出「纯净」的假结论。
+        """
+        local = [p for p in UPSTREAM.rglob("*") if p.is_file()] if UPSTREAM.is_dir() else []
+        if not local:
+            return False
+        probe = local[:5]
+        hit = 0
+        for p in probe:
+            src = cand / p.relative_to(UPSTREAM)
+            if src.is_file():
+                try:
+                    if sha256_of(src) == sha256_of(p):
+                        hit += 1
+                except OSError:
+                    pass
+        # 抽样的全部命中才认账（任一不同即说明不是同一份原件）
+        return hit == len(probe)
+
+    env = os.environ.get("VT_UPSTREAM_ORIGIN")
+    candidates: list[Path] = []
+    if env:
+        candidates.append(Path(env))
+    roots = [Path("/mnt") / d for d in "cdefg"] + [Path("/media"), Path("/opt"), ROOT.parent]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for depth_glob in (name, "*/" + name, "*/*/" + name):
+            try:
+                candidates.extend(sorted(p for p in root.glob(depth_glob) if p.is_dir()))
+            except OSError:
+                continue
+    for cand in candidates:
+        if cand.is_dir() and verified(cand):
+            return cand
+    return None
+
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 results: list[tuple[str, str, str]] = []   # (检查项, 三态, 说明)
 
@@ -282,7 +336,7 @@ def main() -> int:
     print(f"  解释器: {sys.executable}")
 
     origin_arg = args.upstream_origin or os.environ.get("VT_UPSTREAM_ORIGIN")
-    origin = Path(origin_arg) if origin_arg else None
+    origin = Path(origin_arg) if origin_arg else find_upstream_origin()
 
     r1_samples(args.freeze)
     if not args.freeze:
