@@ -20,7 +20,12 @@
 
 `skill/` 与 `scripts/` 下的代码与文档**不得写死本机绝对路径**（如 `C:\Users\lk\...`）。路径一律运行时探测 + 环境变量覆盖。
 
-> ⚠️ 已知技术债：当前 `skill/SKILL.md` 与 `skill/scripts/video_text_extract.py` 中**仍写死了本机的 Python venv 与模型缓存路径**（承自上游技能文档）。这是迁入时的原样保留，**不是合规状态**，须在"技能整理"板块中修复。
+> ✅ **该技术债已于 2026-09-25 修复**（提交 `2b59ca0`「收口 D1/D2」，硬编码 strict 口径 16→0）：
+> `SKILL.md` 主路线已改写为运行时探测，`video_text_extract.py` 的 venv/模型缓存路径已改为
+> `os.environ` + `Path.home()` 探测。
+> 复核（2026-09-27）：`scripts/check-hardcode.py` 两口径 **HIT=0**；
+> 对 `skill/` 全目录扫「盘符+用户名」「hermes」「venv」关键词**均零命中**。
+> （原警示文本保留在此仅为留痕：它曾是正确的，现已过期。）
 
 ### 3. 纠正必须给依据
 
