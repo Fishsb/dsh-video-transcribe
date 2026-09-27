@@ -1711,7 +1711,11 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--frames", action="store_true",
                    help="一条命令连带画面层（抽帧 + 视觉模型 OCR），默认关")
     add_frames_switches(b)
-    add_common_switches(b, resume_help="已有 info.json / audio.wav / 原始转写.txt / 已完成帧的 OCR 结果则跳过重做")
+    add_common_switches(
+        b,
+        resume_help="已有产物则跳过重做（最贵的两项——ASR 转写与帧 OCR——总能跳过）。"
+                    "注意：默认清理会删掉 audio.wav / video.m4s 等中间物，故重跑时音轨与视频流"
+                    "需重新下载（各约 1-2 秒）；要连中间物一起复用就同时加 --keep-intermediate")
     b.set_defaults(func=cmd_bili)
     return p
 
