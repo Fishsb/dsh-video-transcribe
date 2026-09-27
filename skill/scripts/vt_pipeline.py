@@ -183,17 +183,31 @@ def _decode_body(headers, raw: bytes) -> str:
     raise RuntimeError(f"响应解码失败（content-encoding={enc or '未声明'}）: {last}")
 
 
+def bili_cookie() -> str:
+    """可选登录 cookie（VT_BILI_COOKIE），用于取需登录才可见的 CC 字幕轨。
+
+    实测：未登录时 60/60 个热门视频的 subtitle 都返回空且 need_login_subtitle=true，
+    即「无 cookie ⇒ 字幕路由实际不可用」。留此开关，有 cookie 者可走字幕优先。
+    ⚠️ cookie 只从环境变量读，不落盘、不写进 info.json（避免凭据进产物）。
+    """
+    return env_path("VT_BILI_COOKIE")
+
+
 def bili_get(path_with_query: str, timeout: float | None = None) -> str:
     """GET api.bilibili.com，返回解码后的文本。评论区/弹幕/元数据共用。"""
     conn = http.client.HTTPSConnection(BILI_HOST, timeout=timeout or timeout_http())
     try:
-        conn.request("GET", path_with_query, headers={
+        hdrs = {
             "User-Agent": UA,
             "Referer": BILI_REFERER,
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate",
             "Connection": "close",
-        })
+        }
+        ck = bili_cookie()
+        if ck:
+            hdrs["Cookie"] = ck
+        conn.request("GET", path_with_query, headers=hdrs)
         resp = conn.getresponse()
         raw = resp.read()
         text = _decode_body(resp.headers, raw)
@@ -225,6 +239,100 @@ def fetch_view(bvid: str) -> dict:
         raise SystemExit(f"[错误] view 接口 code={j.get('code')} message={j.get('message')} "
                          f"（视频不存在/被删/地区限制）")
     return j["data"]
+
+
+def fetch_player(bvid: str, cid: int) -> tuple[dict, str]:
+    """取 x/player/v2（字幕信息的唯一可靠来源）。返回 (data, err)。
+
+    为什么不从 view 接口拿字幕：view.subtitle 只有 {allow_submit, list}，而
+    **allow_submit 是「观众可否投稿字幕」，与「本视频有没有字幕」无关**（实测 4 个
+    不同视频恒为 false）。真正的门在 player/v2 的 need_login_subtitle。
+    """
+    try:
+        j = bili_get_json(f"/x/player/v2?bvid={bvid}&cid={cid}")
+        return (j.get("data") or {}), ""
+    except Exception as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+def fetch_subtitles(bvid: str, cid: int) -> tuple[list, bool, str]:
+    """探测 CC 字幕轨。返回 (轨列表, 是否需登录, 错误)。
+
+    ⚠️ 区分三态是本函数存在的理由（此前实现把三者混为「无字幕」静默降级）：
+      · need_login_subtitle=True 且轨为空 → 「需登录，未知有无」← 不是「无字幕」
+      · 轨非空                            → 有字幕，可直接取用
+      · 前两者皆非且轨为空                → 确认无字幕轨
+    """
+    data, err = fetch_player(bvid, cid)
+    if err:
+        return [], False, err
+    sub = data.get("subtitle") or {}
+    subs = sub.get("subtitles") or []
+    need_login = bool(data.get("need_login_subtitle"))
+    if need_login and not subs:
+        return [], True, ""
+    return list(subs), False, ""
+
+
+def subtitle_to_text(payload: dict) -> tuple[str, list]:
+    """B站字幕 JSON → (整段文本, 分段时间轴)。
+
+    字幕 JSON 结构（实测契约）：{"body":[{"from":秒,"to":秒,"content":"文本"}, ...]}
+    返回的分段与 ASR 路的 segments 同构（start/end/text），下游可无差别使用。
+    """
+    segs = []
+    for item in (payload.get("body") or []):
+        txt = (item.get("content") or "").strip()
+        if not txt:
+            continue
+        segs.append({"start": round(float(item.get("from") or 0), 1),
+                     "end": round(float(item.get("to") or 0), 1),
+                     "text": txt})
+    # 字幕逐句一行，直接拼接会黏成一片；用逗号衔接保留断句感
+    return "，".join(s["text"] for s in segs), segs
+
+
+def try_subtitle_route(bvid: str, cid: int) -> tuple[dict | None, str]:
+    """尝试字幕优先路线。返回 (转写字典 或 None, 说明)。
+
+    None 的三种成因必须能区分（此前实现把三者都静默降级成「无字幕」）：
+      · 确实无字幕轨        → "无字幕轨"
+      · 需登录而未登录      → 显式写明，提示可用 VT_BILI_COOKIE
+      · 探测/下载出错       → 写明错误，不当成「无字幕」
+    """
+    subs, need_login, err = fetch_subtitles(bvid, cid)
+    if err:
+        return None, f"字幕探测失败（结果未知）: {err}"
+    if not subs:
+        if need_login:
+            return None, ("字幕轨需登录才可见（need_login_subtitle=true），"
+                          "本次未登录故无法判定有无字幕；如确有字幕可设 VT_BILI_COOKIE 后重试")
+        return None, "确认无字幕轨（player/v2 返回空且无需登录）"
+    # 优先中文字幕轨，否则取第一条
+    pick = next((s for s in subs if (s.get("lan") or "").startswith("zh")), subs[0])
+    url = pick.get("subtitle_url") or ""
+    if not url:
+        return None, f"字幕轨存在但无 subtitle_url: {pick!r}"
+    try:
+        payload = fetch_subtitle_body(url)
+    except Exception as exc:
+        return None, f"字幕正文下载失败（轨存在但取不到）: {type(exc).__name__}: {exc}"
+    text, segs = subtitle_to_text(payload)
+    if not text.strip():
+        return None, "字幕正文解析后为空（轨存在但内容为空）"
+    lang = pick.get("lan") or "?"
+    return ({"text": text, "segments": segs, "mode": "subtitle",
+             "duration_sec": segs[-1]["end"] if segs else 0.0,
+             "segment_sec": None, "subtitle_lan": lang}, f"字幕优先命中（轨 {lang}，{len(segs)} 句）")
+
+
+def fetch_subtitle_body(url: str) -> dict:
+    """拉取字幕正文（subtitle_url 常为 //aisubtitle... 协议相对地址）。"""
+    u = url.strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    u = re.sub(r"^https?://", "", u)
+    return json.loads(bili_get(u))
 
 
 def fetch_tags(bvid: str) -> tuple[list, str]:
@@ -524,6 +632,7 @@ def build_info(bvid: str) -> dict:
     tags, tag_err = fetch_tags(bvid)
     comments, reply_err = fetch_replies(aid)
     danmaku, dm_err = fetch_danmaku(cid)
+    subs, need_login, sub_err = fetch_subtitles(bvid, cid)
     stat = view.get("stat") or {}
     notes = []
     if tag_err:
@@ -532,6 +641,11 @@ def build_info(bvid: str) -> dict:
         notes.append(f"reply 接口不可用: {reply_err}")
     if dm_err:
         notes.append(f"弹幕接口不可用: {dm_err}")
+    if sub_err:
+        notes.append(f"字幕探测失败（结果未知，不等于无字幕）: {sub_err}")
+    elif need_login:
+        notes.append("字幕轨需登录才可见（need_login_subtitle=true）——"
+                     "本次未登录，无法判定该视频有无字幕；不要读作「无字幕」")
     info = {
         "source": f"https://www.bilibili.com/video/{bvid}",
         "bvid": bvid,
@@ -546,7 +660,15 @@ def build_info(bvid: str) -> dict:
         "owner": {"mid": (view.get("owner") or {}).get("mid", 0),
                   "name": (view.get("owner") or {}).get("name", "")},
         "stat": stat,
-        "subtitle_available": 1 if ((view.get("subtitle") or {}).get("allow_submit")) else 0,
+        # 旧实现用 view.subtitle.allow_submit 算此字段 —— 那表示「观众可否投稿字幕」，
+        # 与「本视频有无字幕」无关（实测 4 个视频恒 false ⇒ 该字段实际永远是 0，是死字段）。
+        # 现改为据 player/v2 的三态。键名保持兼容（R4 断言 info.json 键数 ≥17）。
+        "subtitle_available": 1 if subs else 0,
+        "subtitle_need_login": 1 if need_login else 0,
+        "subtitle_state": ("has_subtitles" if subs else
+                           "need_login_unknown" if need_login else
+                           "probe_failed" if sub_err else "no_subtitle"),
+        "subtitle_tracks": subs,
         "comments_count": len(comments),
         "comments": comments,
         "danmaku_count": len(danmaku),
@@ -1430,14 +1552,22 @@ def cmd_bili(args) -> int:
         fresh.append(wav)
         prog.done("转 wav", t0)
 
-    # ---- [4] 转写 ----
+    # ---- [4] 转写（字幕优先 → 无字幕退 ASR） ----
     tr_p, seg_p = outdir / "原始转写.txt", outdir / "原始转写_分段.md"
     tr: dict = {}
+    # 字幕优先：--subtitle-first 或 设了 VT_BILI_COOKIE 时自动尝试。
+    # 默认不改行为：实测无 cookie 时 60/60 视频字幕恒空（need_login_subtitle=true），
+    # 该路线实际不可达；不默认开是为了不引入一次注定落空的多余请求。
+    want_sub = bool(getattr(args, "subtitle_first", False)) or bool(bili_cookie())
     if resume and _have(tr_p):
         txt = tr_p.read_text(encoding="utf-8").strip()
         tr = {"text": txt, "segments": [], "mode": "resumed",
               "duration_sec": round(probe_duration(wav), 1)}
         prog.skip("宿主 ASR 转写", f"复用已有 {tr_p}（{len(txt)} 字）")
+    elif want_sub and (sub_res := try_subtitle_route(bvid, cid)) and sub_res[0]:
+        tr, sub_note = sub_res
+        write_transcript(outdir, tr, args.language)
+        prog.done("字幕优先", time.time(), f"{len(tr['text'])} 字 / {len(tr['segments'])} 句（{sub_note}）")
     else:
         seg_n = max(1, int(-(-(probe_duration(wav) or 1) // max(1, args.segment))))
         t0 = prog.start(f"宿主 ASR 转写（长音频自动切片）", eta_sec=5.3 * seg_n)
@@ -1447,6 +1577,9 @@ def cmd_bili(args) -> int:
         if seg_dir.is_dir():   # 切片目录由 transcribe_wav 内部产生，这里登记进本次中间物
             fresh.append(seg_dir)
         prog.done("转写", t0, f"{len(tr['text'])} 字 / {len(tr.get('segments') or [])} 段")
+        if want_sub:
+            _, why = try_subtitle_route(bvid, cid)
+            print(f"  [字幕] 未走字幕路线：{why}")
 
     # ---- [5] 画面层（可选） ----
     frame_note = "未启用（需要画面层请加 --frames）"
@@ -1573,6 +1706,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("target", help="B站 URL 或 BV 号")
     b.add_argument("--language", default="zh")
     b.add_argument("--segment", type=int, default=30)
+    b.add_argument("--subtitle-first", action="store_true",
+                   help="优先用 B站 CC 字幕（需 VT_BILI_COOKIE；无字幕则自动退 ASR）")
     b.add_argument("--frames", action="store_true",
                    help="一条命令连带画面层（抽帧 + 视觉模型 OCR），默认关")
     add_frames_switches(b)

@@ -51,10 +51,20 @@ skill/scripts/vt_pipeline.py   # 纯 Python 标准库，零第三方依赖
   ③ 转写　：vt_pipeline.py transcribe <URL> → 原始转写.txt / 原始转写_分段.md
   ④ 一条龙：vt_pipeline.py bili <URL>              → ①+②+③ 一次完成
            vt_pipeline.py bili <URL> --frames     → ①+②+③+画面层（三层产物一次给全）
+           vt_pipeline.py bili <URL> --subtitle-first → 优先试 CC 字幕（需 VT_BILI_COOKIE；
+                                                          无字幕自动退 ASR 并打印原因）
   ⑤ 纠正成稿：读 info.json + 原始转写 + 帧OCR原始结果 → 最终文案.md（见「最终文案格式规范」）
 ```
 
 优先级：**软字幕 > 语音转写 > OCR**；在线场景 **字幕 > 取音轨转写**。
+
+> ⚠️ **在线字幕路线的实测限制（2026-09-27）**：B站 CC 字幕**需登录 cookie 才可见**——
+> 未登录时实测 **60/60 个热门视频**的 player/v2.subtitle.subtitles 皆为空、
+> 且 need_login_subtitle=true。故在线「字幕优先」**默认不可达**，只在这两种情况下可用：
+> 设了 VT_BILI_COOKIE（自动尝试）或显式加 --subtitle-first。
+> info.json 的 subtitle_state 用**四态**区分（不再是含糊的 0/1）：
+> has_subtitles / need_login_unknown / no_subtitle / probe_failed——
+> **need_login_unknown 不等于「无字幕」**，不得据此断言该视频没有字幕。
 
 > 需要完整三层产物时**一条命令就够**：`bili <URL> --frames`（2026-09-26 起）。
 > 画面层与音轨共用一个 playurl 结果，视频流已下过就不重下。
